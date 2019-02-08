@@ -124,7 +124,10 @@ func injectErrors(name string) {
 		astFile: parsedFile,
 	}
 	file.edit.Insert(file.offset(file.astFile.Name.End()),
-		fmt.Sprintf("; import %s %q", randPackageName, randPackagePath))
+		fmt.Sprintf(`
+import %s %q
+var _ = rand.Int
+`, randPackageName, randPackagePath))
 
 	ast.Walk(file, file.astFile)
 	newContent := file.edit.Bytes()
