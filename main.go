@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
 	"go/ast"
@@ -29,14 +30,14 @@ func usage() {
 }
 
 var output = flag.String("o", "", "file for output; default: stdout")
-var errorPercent = flag.Int("error-percent", 5, "percent error likelihood")
+var errorPercent = flag.Float64("error-percent", 0.1, "percent error likelihood")
 
 const (
 	randPackagePath = "math/rand"
 	randPackageName = "_errorsmith_rand_"
 
-	errorsPackagePath = "github.com/pkg/errors"
-	errorsPackageName = "_errorsmith_errors_"
+	fmtPackagePath = "fmt"
+	fmtPackageName = "_errorsmith_fmt_"
 )
 
 func main() {
@@ -61,6 +62,42 @@ type File struct {
 	edit    *Buffer
 }
 
+// findText finds text in the original source, starting at pos.
+// It correctly skips over comments and assumes it need not
+// handle quoted strings.
+// It returns a byte offset within f.src.
+func (f *File) findText(pos token.Pos, text string) int {
+	b := []byte(text)
+	start := f.offset(pos)
+	i := start
+	s := f.content
+	for i < len(s) {
+		if bytes.HasPrefix(s[i:], b) {
+			return i
+		}
+		if i+2 <= len(s) && s[i] == '/' && s[i+1] == '/' {
+			for i < len(s) && s[i] != '\n' {
+				i++
+			}
+			continue
+		}
+		if i+2 <= len(s) && s[i] == '/' && s[i+1] == '*' {
+			for i += 2; ; i++ {
+				if i+2 > len(s) {
+					return 0
+				}
+				if s[i] == '*' && s[i+1] == '/' {
+					i += 2
+					break
+				}
+			}
+			continue
+		}
+		i++
+	}
+	return -1
+}
+
 // Visit implements the ast.Visitor interface.
 func (f *File) Visit(node ast.Node) ast.Visitor {
 	switch n := node.(type) {
@@ -78,9 +115,15 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 							// We found an if of form err == nil. Inject a fault!
 							f.edit.Insert(f.offset(n.Pos()),
 								fmt.Sprintf(`if %s.Int() %% %d == 0 {
-    err = %s.New("injected error at %s:%d")
+    %s.Printf("injected error at %s:%d\n")
+    err = %s.Errorf("injected error at %s:%d")
 }
-`, randPackageName, 100/(*errorPercent), errorsPackageName, f.name, f.fset.Position(n.Pos()).Line))
+`, randPackageName, int(100/(*errorPercent)),
+									fmtPackageName,
+									f.name, f.fset.Position(n.Pos()).Line,
+									fmtPackageName,
+									f.name, f.fset.Position(n.Pos()).Line,
+								))
 						}
 					}
 				}
@@ -88,9 +131,47 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 		}
 		ast.Walk(f, n.Cond)
 		ast.Walk(f, n.Body)
-		if n.Else != nil {
-			ast.Walk(f, n.Else)
+		if n.Else == nil {
+			return nil
 		}
+		// The elses are special, because if we have
+		//	if x {
+		//	} else if y {
+		//	}
+		// we want to cover the "if y". To do this, we need a place to drop the counter,
+		// so we add a hidden block:
+		//	if x {
+		//	} else {
+		//		if y {
+		//		}
+		//	}
+		elseOffset := f.findText(n.Body.End(), "else")
+		if elseOffset < 0 {
+			panic("lost else")
+		}
+		f.edit.Insert(elseOffset+4, "{")
+		f.edit.Insert(f.offset(n.Else.End()), "}")
+
+		// We just created a block, now walk it.
+		// Adjust the position of the new block to start after
+		// the "else". That will cause it to follow the "{"
+		// we inserted above.
+		pos := f.fset.File(n.Body.End()).Pos(elseOffset + 4)
+		switch stmt := n.Else.(type) {
+		case *ast.IfStmt:
+			block := &ast.BlockStmt{
+				Lbrace: pos,
+				List:   []ast.Stmt{stmt},
+				Rbrace: stmt.End(),
+			}
+			n.Else = block
+		case *ast.BlockStmt:
+			stmt.Lbrace = pos
+		default:
+			panic("unexpected node type in if")
+		}
+		ast.Walk(f, n.Else)
+		return nil
 		return nil
 	}
 	return f
@@ -125,13 +206,13 @@ import %s %q
 import %s %q
 `,
 			randPackageName, randPackagePath,
-			errorsPackageName, errorsPackagePath,
+			fmtPackageName, fmtPackagePath,
 		))
 
 	ast.Walk(file, file.astFile)
 	newContent := file.edit.Bytes()
 	newContent = append(newContent, []byte(fmt.Sprintf("\nvar _ = %s.Int", randPackageName))...)
-	newContent = append(newContent, []byte(fmt.Sprintf("\nvar _ = %s.New", errorsPackageName))...)
+	newContent = append(newContent, []byte(fmt.Sprintf("\nvar _ = %s.Printf", fmtPackageName))...)
 
 	fd := os.Stdout
 	if *output != "" {
