@@ -4,11 +4,14 @@ import (
 	"flag"
 	"fmt"
 	"go/ast"
+	"go/format"
 	"go/parser"
 	"go/token"
 	"io/ioutil"
 	"log"
 	"os"
+
+	"github.com/pkg/errors"
 )
 
 const usageMessage = "" +
@@ -135,5 +138,14 @@ func injectErrors(name string) {
 		}
 	}
 
-	fd.Write(newContent)
+	formatted, err := format.Source(newContent)
+	if err != nil {
+		// Write out incorrect source for easier debugging.
+		formatted = newContent
+		err = errors.Wrap(err, "Code formatting failed with Go parse error")
+	}
+	fd.Write(formatted)
+	if err != nil {
+		log.Fatalf("errorsmith: %s", err)
+	}
 }
