@@ -29,10 +29,14 @@ func usage() {
 }
 
 var output = flag.String("o", "", "file for output; default: stdout")
+var errorPercent = flag.Int("error-percent", 5, "percent error likelihood")
 
 const (
 	randPackagePath = "math/rand"
 	randPackageName = "_errorsmith_rand_"
+
+	errorsPackagePath = "github.com/pkg/errors"
+	errorsPackageName = "_errorsmith_errors_"
 )
 
 func main() {
@@ -45,15 +49,6 @@ func main() {
 	}
 	injectErrors(flag.Arg(0))
 	return
-}
-
-// Block represents the information about a basic block to be recorded in the analysis.
-// Note: Our definition of basic block is based on control structures; we don't break
-// apart && and ||. We could but it doesn't seem important enough to bother.
-type Block struct {
-	startByte token.Pos
-	endByte   token.Pos
-	numStmt   int
 }
 
 // File is a wrapper for the state of a file used in the parser.
@@ -69,6 +64,7 @@ type File struct {
 // Visit implements the ast.Visitor interface.
 func (f *File) Visit(node ast.Node) ast.Visitor {
 	switch n := node.(type) {
+	case *ast.ImportSpec:
 	case *ast.IfStmt:
 		if n.Init != nil {
 			ast.Walk(f, n.Init)
@@ -81,10 +77,10 @@ func (f *File) Visit(node ast.Node) ast.Visitor {
 						if y, ok := e.Y.(*ast.Ident); ok && y.Name == "nil" {
 							// We found an if of form err == nil. Inject a fault!
 							f.edit.Insert(f.offset(n.Pos()),
-								fmt.Sprintf(`if %s.Int() %% 8 == 0 {
-    err = errors.New("injected error at %s:%d")
+								fmt.Sprintf(`if %s.Int() %% %d == 0 {
+    err = %s.New("injected error at %s:%d")
 }
-`, randPackageName, f.name, f.fset.Position(n.Pos()).Line))
+`, randPackageName, 100/(*errorPercent), errorsPackageName, f.name, f.fset.Position(n.Pos()).Line))
 						}
 					}
 				}
@@ -126,11 +122,16 @@ func injectErrors(name string) {
 	file.edit.Insert(file.offset(file.astFile.Name.End()),
 		fmt.Sprintf(`
 import %s %q
-var _ = rand.Int
-`, randPackageName, randPackagePath))
+import %s %q
+`,
+			randPackageName, randPackagePath,
+			errorsPackageName, errorsPackagePath,
+		))
 
 	ast.Walk(file, file.astFile)
 	newContent := file.edit.Bytes()
+	newContent = append(newContent, []byte(fmt.Sprintf("\nvar _ = %s.Int", randPackageName))...)
+	newContent = append(newContent, []byte(fmt.Sprintf("\nvar _ = %s.New", errorsPackageName))...)
 
 	fd := os.Stdout
 	if *output != "" {
@@ -148,6 +149,7 @@ var _ = rand.Int
 		err = errors.Wrap(err, "Code formatting failed with Go parse error")
 	}
 	fd.Write(formatted)
+
 	if err != nil {
 		log.Fatalf("errorsmith: %s", err)
 	}
